@@ -1,0 +1,189 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 267b848..431375f 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -2778,13 +2778,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+         }
+     ).set_env("LLAMA_ARG_N_CPU_MOE"));
+     add_opt(common_arg(
+-        {"--moe-cache-mib"}, "N",
++        {"--moe-cache-mib"}, "MODE",
+         "GPU cache size in MiB for the MoE experts kept in the CPU. with multiple GPUs, it is split among them like the layers (--tensor-split) (default: 0, disabled)",
+-        [](common_params & params, int value) {
+-            if (value < 0) {
++        [](common_params & params, const std::string & value) {
++            if (value == "auto") {             // 按实测剩余显存
++                params.moe_cache_size = (size_t) -1;
++                return;
++            }
++            const int n = std::stoi(value);
++            if (n < 0) {
+                 throw std::invalid_argument("invalid value");
+             }
+-            params.moe_cache_size = (size_t) value*1024*1024;
++            params.moe_cache_size = (size_t) n*1024*1024;
+         }
+     ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
+     add_opt(common_arg(
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 9ee64b5..d233e88 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -548,8 +548,42 @@ llama_context::llama_context(
+             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
+         }
+ 
++        // 显式覆盖：LLAMA_MOE_CACHE_MIB=N（MiB），优先级高于 auto
++        if (const char * env_mib = getenv("LLAMA_MOE_CACHE_MIB")) {
++            const long long mib = atoll(env_mib);
++            if (mib > 0) {
++                cparams.moe_cache_size = (size_t) mib * 1024 * 1024;
++                LLAMA_LOG_INFO("%s: moe-cache size overridden by LLAMA_MOE_CACHE_MIB = %lld MiB\n", __func__, mib);
++            }
++        }
++        if (cparams.moe_cache_size == (size_t) -1) {   // auto：按当前实测剩余显存
++            size_t vfree = 0, vtotal = 0;
++            for (auto * be : backend_ptrs) {
++                ggml_backend_dev_t d = ggml_backend_get_device(be);
++                if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU) {
++                    ggml_backend_dev_memory(d, &vfree, &vtotal);
++                    break;
++                }
++            }
++            // 预留：至少 700MiB 或 15% 的空闲；可用 LLAMA_MOE_CACHE_RESERVE_MIB 显式指定
++            // （给桌面/浏览器/视频解码留显存，例如 2048 = 留 2 GiB）
++            size_t reserve = std::max<size_t>(700ull * 1024 * 1024, (size_t)(vfree * 15 / 100));
++            if (const char * env_reserve = getenv("LLAMA_MOE_CACHE_RESERVE_MIB")) {
++                const long long mib = atoll(env_reserve);
++                if (mib > 0) {
++                    reserve = std::max<size_t>(reserve, (size_t) mib * 1024 * 1024);
++                }
++            }
++            cparams.moe_cache_size = vfree > reserve ? (vfree - reserve) : 0;
++            LLAMA_LOG_INFO("%s: moe-cache auto size = %.2f GiB (free=%.2f GiB, reserve=%.2f GiB)\n",
++                           __func__, (double) cparams.moe_cache_size / (1 << 30), (double) vfree / (1 << 30),
++                           (double) reserve / (1 << 30));
++        }
+         if (cparams.moe_cache_size > 0) {
+             moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size);
++            if (const char * heat_path = getenv("LLAMA_EXPERT_HEAT")) {
++                moe_cache->seed_from_heat(heat_path);
++            }
+         }
+ 
+         sched_reserve();
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index 4d3596b..06ab4ec 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -1,5 +1,9 @@
+ #include "llama-moe-cache.h"
+ 
++#include <fstream>
++#include <algorithm>
++#include <cstring>
++
+ #include "llama-impl.h"
+ #include "llama-model.h"
+ 
+@@ -511,6 +515,74 @@ struct llama_moe_cache::impl {
+         return it != bindings.end() ? it->second.cached : nullptr;
+     }
+ 
++    // 热度表播种：按热度把 (layer, expert) 预置到各 group 的槽位并上传
++    void seed_from_heat(const char * path) {
++        std::ifstream f(path, std::ios::binary);
++        if (!f) { LLAMA_LOG_WARN("moe-cache seed: cannot open %s\n", path); return; }
++        char magic[8] = {0};
++        f.read(magic, 8);
++        if (std::memcmp(magic, "MOEHEAT1", 8) != 0) { LLAMA_LOG_WARN("moe-cache seed: bad magic\n"); return; }
++        uint32_t n_layer = 0, n_expert = 0;
++        f.read((char *) &n_layer, 4);
++        f.read((char *) &n_expert, 4);
++        std::vector<uint64_t> ebytes(n_layer);
++        f.read((char *) ebytes.data(), (std::streamsize)(n_layer * sizeof(uint64_t)));
++        std::vector<uint32_t> counts((size_t) n_layer * n_expert);
++        f.read((char *) counts.data(), (std::streamsize)(counts.size() * sizeof(uint32_t)));
++
++        int64_t seeded = 0;
++        for (auto & g : groups) {
++            if (g.n_slots <= 0 || !g.slru.slot_map.size()) continue;
++            // fit / dry-run：权重未加载，跳过播种
++            bool have_data = true;
++            for (int32_t il : g.layers) {
++                if (il < 0 || (size_t) il >= layers.size()) continue;
++                for (const auto * w : layers[(size_t) il].experts) {
++                    if (!w || !w->data) { have_data = false; break; }
++                }
++                if (!have_data) break;
++            }
++            if (!have_data) continue;
++            auto & sl = g.slru;
++            const int32_t ne = sl.n_expert;
++
++            struct cand { uint32_t c; int32_t il, e; };
++            std::vector<cand> cands;
++            for (int32_t il : g.layers) {
++                if (il < 0 || il >= (int32_t) n_layer) continue;
++                for (int32_t e = 0; e < ne && e < (int32_t) n_expert; ++e) {
++                    const uint32_t c = counts[(size_t) il * n_expert + (size_t) e];
++                    if (c) cands.push_back({c, il, e});
++                }
++            }
++            std::sort(cands.begin(), cands.end(), [](const cand & a, const cand & b){ return a.c > b.c; });
++
++            const int32_t take = std::min<int32_t>(g.n_slots, (int32_t) cands.size());
++            for (int32_t i = 0; i < take; ++i) {
++                const int32_t il = cands[(size_t) i].il;
++                const int32_t e  = cands[(size_t) i].e;
++                const int32_t slot = i;
++                sl.slot_map[(size_t) il][(size_t) e] = slot;
++                sl.key_of[(size_t) slot] = il * ne + e;
++                sl.move(slot, /*protect=*/true);   // 作为最近使用，先受保护
++
++                // 上传数据到 bank
++                const layer & l = layers[(size_t) il];
++                ggml_backend_t be = devices[(size_t) g.id].backend;
++                for (size_t ip = 0; ip < l.experts.size() && ip < g.banks.size(); ++ip) {
++                    const ggml_tensor * w = l.experts[ip];
++                    ggml_tensor * bank = g.banks[ip];
++                    const size_t esz = w->nb[2];
++                    ggml_backend_tensor_set_async(be, bank, (const uint8_t *) w->data + (size_t) e * esz,
++                                                  (size_t) slot * esz, esz);
++                }
++                ggml_backend_synchronize(devices[(size_t) g.id].backend);
++                ++seeded;
++            }
++        }
++        LLAMA_LOG_INFO("moe-cache seed: %s -> %lld experts preloaded\n", path, (long long) seeded);
++    }
++
+     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {
+         const auto it = bindings.find(w);
+         if (it == bindings.end()) {
+@@ -651,6 +723,10 @@ ggml_tensor * llama_moe_cache::get_experts(const ggml_tensor * w) const {
+     return pimpl->get_experts(w);
+ }
+ 
++void llama_moe_cache::seed_from_heat(const char * path) {
++    pimpl->seed_from_heat(path);
++}
++
+ bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
+     return pimpl->copy(backend, src, dst, graph);
+ }
+diff --git a/src/llama-moe-cache.h b/src/llama-moe-cache.h
+index 9baf063..fc893fc 100644
+--- a/src/llama-moe-cache.h
++++ b/src/llama-moe-cache.h
+@@ -32,6 +32,10 @@ public:
+     // returns the number of experts copied, 0 if expert e is not in the cache
+     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last);
+ 
++    // 热度表播种（本 fork 增强）：把热度最高的专家预置进缓存槽并上传
++    // path 为 MOEHEAT1 二进制（tools/aggregate_heat.py 产出）
++    void seed_from_heat(const char * path);
++
+     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
+ 
+ private:
