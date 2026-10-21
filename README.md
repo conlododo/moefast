@@ -30,11 +30,18 @@ at 4K, while vanilla llama.cpp is last everywhere.
 ### Option A — ready-to-clone branch (no patching)
 
 ```bash
+# if the fork's default branch is set to feat/moe-cache-main:
+git clone https://github.com/conlododo/llama.cpp
+# otherwise:
 git clone -b feat/moe-cache-main https://github.com/conlododo/llama.cpp
+
 cd llama.cpp
 ./moefast/install.sh
 ./moefast/run.sh /path/to/model.gguf
 ```
+
+Ready-made branch: **https://github.com/conlododo/llama.cpp/tree/feat/moe-cache-main**
+(tag `moefast-v1`), upstream `1ba568c` + 8 commits.
 
 The branch is upstream `1ba568c` + the same 8 small commits you see in `patches/`, and it already
 contains the `moefast/` directory, so nothing else is needed.
