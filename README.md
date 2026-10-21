@@ -37,6 +37,11 @@ at 4K, while vanilla llama.cpp is last everywhere.
 The whole diff against upstream is **123 lines in 4 files** — see
 [`patches/moefast.patch`](patches/moefast.patch).
 
+This repo ships **only the patch** (no vendored llama.cpp source): the patch is pinned to upstream
+commit `1ba568c` (2026-10-20 master). Upstream moves fast — the three files we touch each changed
+once within the next day — so on newer revisions expect a small conflict and use `git apply -3`
+(or rebase the patch; it is 4 files, ~120 lines).
+
 ---
 
 ## Quick start
@@ -45,10 +50,12 @@ The whole diff against upstream is **123 lines in 4 files** — see
 # 1. upstream at the commit this patch was written against
 git clone https://github.com/ggml-org/llama.cpp
 cd llama.cpp
-git checkout 1ba568c
+git checkout 1ba568c          # pinned: 2026-10-20 master
 
 # 2. apply the patch
 git apply /path/to/moefast.patch        # or: git apply moefast/patches/moefast.patch
+# if upstream has moved on and this fails, try a 3-way merge:
+#   git apply -3 moefast/patches/moefast.patch
 
 # 3. drop this directory next to it (so `moefast/` sits inside the llama.cpp root)
 cp -r /path/to/moefast .
