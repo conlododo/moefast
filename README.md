@@ -9,6 +9,19 @@ The trick is not to fit the whole model in VRAM. It is to keep **all expert weig
 with cold experts computed on the CPU. A routing heat table pre-fills the VRAM cache at startup so
 the model is fast from the very first token.
 
+### TL;DR (16 GB test rig, same model, MTP enabled in all three)
+
+| | vanilla llama.cpp | Strata (16 GB) | **moefast** | vs vanilla | vs Strata |
+|---|---:|---:|---:|---:|---:|
+| Decode @ 1K ctx | 60.7 tok/s | 111.7 | **114.8** | **+89%** | +3% |
+| Decode @ 4K ctx | 59.7 tok/s | 89.0 | **113.4** | **+90%** | **+27%** |
+| TTFT @ 1K prompt | 1.259 s | 0.723 s | **0.615 s** | **2.0× faster** | **1.2× faster** |
+| TTFT @ 4K prompt | 2.186 s | 1.448 s | **1.427 s** | **1.5× faster** | ~equal |
+
+Two things to notice: **the gap to vanilla llama.cpp is ~90% on decode and 2× on latency**, and
+**the advantage over a hand-tuned dedicated engine grows with context** (parity at 1K, +27% at 4K)
+because the expert cache does not decay as the KV grows. Full tables further down.
+
 Written against Qwen3.6-35B-A3B (35.5B total / 3B active, 40 layers, 256 experts, top-8), which is a
 good worst case: **18.3 GB of expert weights on a 16 GB card**, with 2.5 GB of dense weights and a
 3.3 GB KV cache (200K context) competing for the same memory.
