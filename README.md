@@ -25,6 +25,35 @@ at 4K, while vanilla llama.cpp is last everywhere.
 
 ---
 
+## Two ways to use it
+
+### Option A — ready-to-clone branch (no patching)
+
+```bash
+git clone -b feat/moe-cache-main https://github.com/conlododo/llama.cpp
+cd llama.cpp
+./moefast/install.sh
+./moefast/run.sh /path/to/model.gguf
+```
+
+The branch is upstream `1ba568c` + the same 8 small commits you see in `patches/`, and it already
+contains the `moefast/` directory, so nothing else is needed.
+
+### Option B — apply the patch to your own upstream checkout
+
+```bash
+git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
+git checkout 1ba568c
+git apply -3 /path/to/moefast/patches/moefast.patch
+cp -r /path/to/moefast .
+./moefast/install.sh && ./moefast/run.sh /path/to/model.gguf
+```
+
+Use this if you need to stay on your own fork/commit. `-3` makes git do a 3-way merge, which
+usually absorbs small upstream drift.
+
+---
+
 ## How it works
 
 | Piece | What it does | Where it comes from |
