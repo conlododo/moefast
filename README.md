@@ -37,6 +37,22 @@ good worst case: **18.3 GB of expert weights on a 16 GB card**, with 2.5 GB of d
 | **16 GB (our test rig)** | same | 2.5 GB | 18.3 GB | **7-10 GB cache** |
 | 24 GB | same | 2.5 GB | 18.3 GB | 14-18 GB cache, most experts resident |
 
+### Measured scaling with the VRAM budget
+
+Same model, same code, one GPU (RTX 4080 SUPER 32 GB) with the cache capped to emulate smaller
+budgets — this isolates the effect of the cache size itself:
+
+| VRAM budget (dense + KV + cache) | Cache | Decode @1K prompt | TTFT @1K |
+|---|---:|---:|---:|
+| ~8.6 GB → 8 GB-class card | 4.5 GB | 65.6 tok/s | 0.87 s |
+| ~12.7 GB → 12 GB-class card | 8.5 GB | 93.5 tok/s | 0.60 s |
+| ~15.3 GB → 16 GB-class card | 11.0 GB | 114.3 tok/s | 0.48 s |
+
+Decode goes up **~45%** from an 8 GB budget to a 12 GB budget, and another ~22% from 12 GB to 16 GB —
+the cache is the whole story. (The 4080 SUPER has roughly twice the memory bandwidth of the 16 GB
+card in our test rig, so absolute numbers on a real 8/12 GB card will be lower; the *shape* of the
+curve holds.)
+
 It is not magic: the model still has to *run*, so you need enough host RAM for the non-resident
 experts (≈ model size) and a CPU with decent memory bandwidth. What changes is that VRAM stops being
 the hard limit.
