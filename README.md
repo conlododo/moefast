@@ -24,12 +24,15 @@ That is the part this project handles.
 These numbers compare **llama.cpp without the expert cache** and **with it** — the latter is what
 this project configures. The gain is the cache's, not ours; we report it so you know what to expect.
 
-| | llama.cpp, no expert cache | llama.cpp + expert cache (configured by moefast) | Strata (16 GB) |
+| | llama.cpp (expert cache **OFF**) | llama.cpp + expert cache (**ON**, configured by moefast) | Strata (16 GB) |
 |---|---:|---:|---:|
 | Decode @ 1K ctx | 60.7 tok/s | **114.8** | 111.7 |
 | Decode @ 4K ctx | 59.7 tok/s | **113.4** | 89.0 |
 | TTFT @ 1K prompt | 1.259 s | **0.615 s** | 0.723 s |
 | TTFT @ 4K prompt | 2.186 s | **1.427 s** | 1.448 s |
+
+*Legend: every "llama.cpp" column above is **expert cache OFF** (`--moe-cache-mib 0`, all experts
+computed on the CPU). The "moefast" column is the same llama.cpp with the cache ON.*
 
 Read it as: **the cache is worth ~90 % more decode throughput and ~half the time-to-first-token**
 versus running with all experts on the CPU. Whether you get there by hand or with this project, the
@@ -114,6 +117,8 @@ Same model, same code, same 16 GB test platform — the VRAM budget is capped vi
 | ~12.7 GB → 12 GB-class card | 8.5 GB | 93.5 tok/s | 0.60 s |
 | ~15.3 GB → 16 GB-class card | 11.0 GB | 114.3 tok/s | 0.48 s |
 
+*All rows here are cache **ON** (that is the variable being measured: how much cache).*
+
 Decode goes up **~45%** from an 8 GB budget to a 12 GB budget, and another ~22% from 12 GB to 16 GB —
 the cache is the whole story. If you plan for an 8 or 12 GB card, size the cache from the same
 budget rule and expect exactly these steps.
@@ -173,8 +178,11 @@ Reference points on the same rig and model:
 | Stack | TTFT 50 | TTFT 1K | TTFT 4K | decode 50 | decode 1K | decode 4K |
 |---|---:|---:|---:|---:|---:|---:|
 | **moefast** | 0.299 s | **0.615 s** | **1.427 s** | 103.1 | **114.8** | **113.4** |
-| vanilla llama.cpp (experts on CPU, no cache) | 0.603 s | 1.259 s | 2.186 s | 56.1 | 60.7 | 59.7 |
+| llama.cpp (**expert cache OFF**, experts on CPU) | 0.603 s | 1.259 s | 2.186 s | 56.1 | 60.7 | 59.7 |
 | Strata (16 GB instance, `--mtp 2`) | **0.166 s** | 0.723 s | 1.448 s | **120.2** | 111.7 | 89.0 |
+
+*Legend: "llama.cpp (expert cache OFF)" = `--moe-cache-mib 0`; the "moefast" row = same binary with
+the cache ON.*
 
 Takeaway: on tiny prompts a hand-tuned dedicated engine still wins on fixed overhead, but from ~1K
 tokens up the cache wins, and it stays flat at 4K while the alternative decays.
