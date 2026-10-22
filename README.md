@@ -1,28 +1,56 @@
-# moefast — run big MoE models on small-VRAM GPUs
+# moefast — get big MoE models running on small-VRAM GPUs, without the guesswork
 
-`moefast` is a small patch set for [llama.cpp](https://github.com/ggml-org/llama.cpp) that makes
-**large Mixture-of-Experts models usable on low-VRAM GPUs** (8 / 12 / 16 GB class) instead of
-requiring a 24-48 GB card.
+**Two things to be clear about, up front.**
 
-The trick is not to fit the whole model in VRAM. It is to keep **all expert weights in host RAM**
-(mmap'd, so the OS can reclaim them) and keep only the **hot experts** in whatever VRAM is left over,
-with cold experts computed on the CPU. A routing heat table pre-fills the VRAM cache at startup so
-the model is fast from the very first token.
+1. **The speed comes from llama.cpp itself.** The MoE expert cache — keep all expert weights in host
+   RAM, cache the hot ones in VRAM, compute the cold ones on the CPU — is llama.cpp's own work
+   (upstream **#29887 / #30112**). We do not change it, and we do not make it faster.
+2. **What we add is usability + safety.** Sizing the cache automatically, checking whether a model
+   will actually work on your card, generating heat tables with a real tool, and refusing a table
+   that does not belong to the model instead of silently producing wrong numbers.
 
-![decode speed vs VRAM budget — and moefast vs vanilla llama.cpp vs Strata](assets/bench.png)
+So: **same speed as llama.cpp with the expert cache — less chance of getting it wrong.**
 
-### TL;DR (16 GB test rig, same model, MTP enabled in all three)
+What this solves in practice: a 35B-class MoE has ~18 GB of expert weights, which does not fit a
+16 GB card. llama.cpp's cache makes it run anyway (experts streamed from host RAM, only the hot set
+resident). The hard part for a user is the configuration around it: how many MiB to give the cache,
+whether their 8 GB card can even benefit, whether a heat table comes from the right model.
+That is the part this project handles.
 
-| | vanilla llama.cpp | Strata (16 GB) | **moefast** | vs vanilla | vs Strata |
-|---|---:|---:|---:|---:|---:|
-| Decode @ 1K ctx | 60.7 tok/s | 111.7 | **114.8** | **+89%** | +3% |
-| Decode @ 4K ctx | 59.7 tok/s | 89.0 | **113.4** | **+90%** | **+27%** |
-| TTFT @ 1K prompt | 1.259 s | 0.723 s | **0.615 s** | **2.0× faster** | **1.2× faster** |
-| TTFT @ 4K prompt | 2.186 s | 1.448 s | **1.427 s** | **1.5× faster** | ~equal |
+![decode speed vs VRAM budget — and llama.cpp ± expert cache vs Strata](assets/bench.png)
 
-Two things to notice: **the gap to vanilla llama.cpp is ~90% on decode and 2× on latency**, and
-**the advantage over a hand-tuned dedicated engine grows with context** (parity at 1K, +27% at 4K)
-because the expert cache does not decay as the KV grows. Full tables further down.
+### What the expert cache buys (16 GB test rig, same model, MTP on)
+
+These numbers compare **llama.cpp without the expert cache** and **with it** — the latter is what
+this project configures. The gain is the cache's, not ours; we report it so you know what to expect.
+
+| | llama.cpp, no expert cache | llama.cpp + expert cache (configured by moefast) | Strata (16 GB) |
+|---|---:|---:|---:|
+| Decode @ 1K ctx | 60.7 tok/s | **114.8** | 111.7 |
+| Decode @ 4K ctx | 59.7 tok/s | **113.4** | 89.0 |
+| TTFT @ 1K prompt | 1.259 s | **0.615 s** | 0.723 s |
+| TTFT @ 4K prompt | 2.186 s | **1.427 s** | 1.448 s |
+
+Read it as: **the cache is worth ~90 % more decode throughput and ~half the time-to-first-token**
+versus running with all experts on the CPU. Whether you get there by hand or with this project, the
+engine is the same — we just make the configuration reproducible.
+
+### What is ours, what is upstream
+
+| Piece | Source |
+|---|---|
+| Expert cache (LRU, host↔VRAM), cold-expert CPU compute, `--moe-cache-mib` | **llama.cpp upstream** (#29887, #30112) |
+| `--moe-cache-mib auto` (size from measured free VRAM, with a reserve) | this project |
+| `moefast-heat check / auto / verify` (support check, heat table, fingerprint) | this project |
+| Heat pre-seeding (`LLAMA_EXPERT_HEAT`) | this project — **low value in practice**, see below |
+| Multi-arch fixes/validation (gpt-oss biases, qwen4exp 512 experts + PLE, arch names) | this project |
+| `run.sh`, `install.sh`, docs, measurements | this project |
+
+**Honest note on heat pre-seeding:** we measured it and it barely moves the needle — the upstream
+LRU converges within tens of tokens on its own. With a large cache the difference is within noise
+(35B: 67.8 vs 67.5 tok/s at 4 GB cache; 125B: 60.1 vs 59.5 tok/s at 24 GB). It is kept as an optional
+feature, not advertised as a speed feature. What survives from the profiling work is the **coverage
+curve**, which tells you how big the cache should be.
 
 **Tried this on a real 8 GB or 12 GB card? Open an issue with your numbers** — we will add
 them to the table (our scaling numbers come from capping the cache, not from real small cards).
@@ -128,7 +156,7 @@ a fresh prompt per run (no prompt-cache reuse), medians over repeated runs.
 
 ---
 
-## Results on the test rig (16 GB)
+## Results on the test rig (16 GB, expert cache on)
 
 | Metric | Value |
 |---|---|
@@ -163,8 +191,19 @@ Two equivalent ways.
 git clone -b feat/moe-cache-main https://github.com/conlododo/llama.cpp
 cd llama.cpp
 ./moefast/install.sh
-./moefast/run.sh /path/to/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
+
+# 1) check the model (seconds, no GPU, no weights loaded)
+./moefast-heat check --model /path/to/model.gguf --vram 16384
+
+# 2) one-time bootstrap: learn routing → heat.bin (35B: ~3-5 min)
+./moefast-heat auto --model /path/to/model.gguf --vram 16384 --out heat.bin
+
+# 3) run (heat.bin is auto-discovered next to the model)
+./moefast/run.sh /path/to/model.gguf
 ```
+
+`run.sh` finds a heat table via: `MOEFAST_HEAT` → model directory (`heat.bin` / `<model>.heat.bin`)
+→ `~/.cache/moefast/` → the bundled table.
 
 ### Option B — apply the patch to your own upstream checkout
 
@@ -208,6 +247,52 @@ LLAMA_EXPERT_HEAT=moefast/heat/heat_qwen36.bin
 | `MOEFAST_CACHE_MIB` | `auto` | expert cache: `auto`, `0`, or MiB |
 | `MOEFAST_HEAT` | `moefast/heat/heat_qwen36.bin` | heat table |
 | `MOEFAST_HOST` | `127.0.0.1` | bind address |
+| `MOEFAST_LOG_HIT` | unset | `1` = log hit-rate every `MOEFAST_LOG_HIT_SEC` (default 60) s |
+| `MOEFAST_PROFILE_OUT` | unset | learning mode: export routing counts to this JSON |
+| `LLAMA_MOE_CACHE_RESERVE_MIB` | unset | reserve ≥ N MiB when `--moe-cache-mib auto` |
+
+### The `moefast-heat` tool (0.2)
+
+```bash
+./moefast-heat check   --model m.gguf --vram 16384
+./moefast-heat auto    --model m.gguf --vram 16384 --out heat.bin [--limit N | --full]
+./moefast-heat convert --from learn.json --to heat.bin --model m.gguf
+./moefast-heat verify  --heat heat.bin [--model m.gguf]
+```
+
+`check` (no GPU, no weight loading) prints architecture, layer/expert counts, layout, per-expert
+bytes, the **minimum cache** (below it the cache is bypassed/refused) and a recommended size:
+
+```
+arch      : qwen35moe   ✅ supported
+layers    : 40 (meta 41)   experts: 256 top-8   layout: stacked
+per-expert: 1.83 MiB/layer (all experts 18.29 GiB)
+min cache : 786 MiB
+kv est    : 520 MiB (ctx 8192, k8v4)
+recommend : cache 13406 MiB → ~183 slots/layer
+```
+
+`auto` runs one learning pass over the built-in prompts (16 by default, `--full` = 64) and writes a
+**MOEHEAT2** table plus `heat.meta.json`. `verify` re-checks a table against a model — a mismatched
+table is refused at startup instead of silently producing wrong numbers.
+
+**Formats**: `MOEHEAT2` carries an arch/dim/per-layer-bytes fingerprint and both prefill+decode
+counts; `MOEHEAT1` (0.1) is still accepted (shape-checked, no fingerprint).
+
+**Learning mode**: run once with `MOEFAST_PROFILE_OUT=/tmp/learn.json`, then
+`moefast-heat convert --from /tmp/learn.json --model ...` — it counts your real traffic, no prompt set.
+
+### Observability
+
+`MOEFAST_LOG_HIT=1 ./moefast/run.sh model.gguf` prints one line every 60 s
+(`MOEFAST_LOG_HIT_SEC` overrides):
+
+```
+moe-cache: decode hit=95.3% (296841/311515) | resident 3914/3914 | uploaded 26682.8 MiB | seeded=yes
+```
+
+Measured on the test rig (35B, 38 % of experts resident): **94-95 % decode hit**, 114-117 tok/s over
+6 consecutive 200-token rounds.
 
 ### Sizing the cache to your card (the important knob)
 
@@ -313,6 +398,12 @@ moefast/
     ├── moefast.patch      +123/−4 lines against upstream 1ba568c
     └── README.md          what changed, how to regenerate
 ```
+
+## Scope of our claims
+
+- We do **not** claim a speed contribution over llama.cpp with the expert cache enabled.
+- The throughput numbers in this README describe **what the cache enables** on a low-VRAM card.
+- What we claim is: fewer ways to get it wrong (sizing, support check, table validation, multi-arch).
 
 ## Credits
 
