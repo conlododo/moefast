@@ -1,4 +1,4 @@
-build/
-*.gguf
-models/
-*.log
+bin/
+__pycache__/
+*.moefast.json
+*.moefast.suggested-*.json
