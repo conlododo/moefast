@@ -33,6 +33,39 @@ good worst case: **18.3 GB of expert weights on a 16 GB card**, with 2.5 GB of d
 
 ---
 
+## The model we test with: lododo-Distill-v1.0
+
+Everything above is measured with **`Qwen3.6-35B-A3B-lododo-Distill-v1.0`**, a distilled fine-tune of
+Qwen3.6-35B-A3B (35.5B total / 3B active, 40 layers, 256 experts top-8). It ships as a single GGUF
+with the MTP block included, so it works with the cache, the heat seeding, and `--spec-type draft-mtp`
+out of the box.
+
+| | |
+|---|---|
+| Size | **22.85 GB** (UD-Q4_K_XL), runs on a 16 GB card with this project |
+| Also in the repo | `lododo-Distill-v1.0-lora-f16.gguf` (40 MB) — apply on top of the stock MTP base to save disk |
+| Sampling | `temperature=0` works well; disable thinking for tooling (`chat_template_kwargs: {enable_thinking: false}`) |
+
+What the distillation actually bought, against the stock 35B-A3B base (same quant, greedy):
+
+| Benchmark | stock 35B-A3B | **lododo-Distill-v1.0** |
+|---|---:|---:|
+| LiveCodeBench / AtCoder (112) | 50.9% | **69.6%** |
+| GPQA Diamond | 43.4% | **53.5%** |
+| BFCL tool calling | 62.0% | **67.0%** |
+| IFEval strict | 24.0% | **33.3%** |
+| GSM8K | 94.4% | **96.0%** |
+| MMLU (58-item spot check) | 74.1% | **75.9%** |
+
+The pattern: **coding / reasoning / tool use improve a lot, general knowledge stays intact.** That is
+exactly the profile you want on a small card, where you pay for every token.
+
+- 🤗 Hugging Face: https://huggingface.co/lododoai/Qwen3.6-35B-A3B-lododo-Distill-v1.0-GGUF
+- 🤖 ModelScope: http://modelscope.cn/models/lododo/Qwen3.6-35B-A3B-lododo-Distill-v1.0-GGUF
+
+> You do not need this particular model — any MoE in the supported list works. This is simply the
+> checkpoint every number in this README was produced with.
+
 ## When this helps
 
 | Your GPU | Total model | Dense part | Experts | What moefast does |
