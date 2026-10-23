@@ -86,7 +86,7 @@ def probe_model(path: str) -> dict:
         if n_nextn and n_layer and il >= n_layer - n_nextn:
             continue
         if nm.endswith(".weight") and len(ne) >= 3:
-            exp_bytes[il] = int(t.n_bytes) // int(ne[2])
+            exp_bytes[il] = exp_bytes.get(il, 0) + int(t.n_bytes) // int(ne[2])
             exp_total += int(t.n_bytes)
 
     per_layer = [exp_bytes.get(i, 0) for i in range(max(0, n_layer - n_nextn))]
@@ -147,8 +147,9 @@ def compute_params(model: dict, machine: dict, ctx_req: int, parallel: int, rese
     if not model.get("is_moe"):
         return {"moe_cache_mib": 0, "min_cache_mib": 0, "slots_per_layer": 0,
                 "ctx": min(ctx_req, model["n_ctx_train"] or ctx_req),
-                "batch": 2048, "ubatch": 2048, "ngl": 99, "ot": [],
-                "parallel": parallel, "mtp": 0}
+                "batch": 2048, "ubatch": 2048,
+                "threads": min(32, os.cpu_count() or 4), "flash_attn": True,
+                "ngl": 99, "ot": [], "parallel": parallel, "mtp": 0}
 
     vram = machine.get("vram_free_mib") or machine["vram_mib"] or 8192
     reserve = max(reserve_mib, int(vram * 0.15), 700)
@@ -169,6 +170,7 @@ def compute_params(model: dict, machine: dict, ctx_req: int, parallel: int, rese
         "slots_per_layer": slots // n_layers if slots else 0,
         "ctx": min(ctx_req, model["n_ctx_train"] or ctx_req),
         "batch": 2048, "ubatch": 2048,
+        "threads": min(32, os.cpu_count() or 4), "flash_attn": True,
         "ngl": 99, "ot": ["exps=CPU"], "parallel": parallel, "mtp": 0,
     }
 
@@ -281,6 +283,9 @@ def cmd_run(args) -> int:
         print(f"moefast: config written → {path}")
     else:
         ok, params = validate(cfg, model, machine, path, args.fix)
+        defaults = compute_params(model, machine, args.ctx, args.parallel, args.reserve)
+        for k, v in defaults.items():
+            params.setdefault(k, v)
         if not ok:
             return 2
         if not params.get("moe_cache_mib") and params.get("min_cache_mib"):
@@ -296,8 +301,11 @@ def cmd_run(args) -> int:
            "-ngl", str(params["ngl"]),
            "-c", str(params["ctx"]),
            "-b", str(params["batch"]), "-ub", str(params["ubatch"]),
+           "-t", str(params.get("threads", 0) or 0),
            "--parallel", str(params["parallel"]),
            "--port", str(args.port), "--host", args.host]
+    if params.get("flash_attn", True):
+        cmd += ["-fa", "on"]
     for pat in params.get("ot") or []:
         cmd += ["-ot", pat]
     if params.get("moe_cache_mib", 0) > 0:
